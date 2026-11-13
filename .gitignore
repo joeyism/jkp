@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.exe
+.env
+*.pem
+*.key
+/tmp/
+node_modules/
+coverage.out
+deploy/ergo/certs/
+internal/store/testdata/*.db

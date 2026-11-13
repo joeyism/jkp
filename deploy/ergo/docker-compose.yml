@@ -1,0 +1,22 @@
+services:
+  ergo:
+    image: ghcr.io/ergochat/ergo:stable
+    container_name: jkp-ergo
+    entrypoint: ["/bin/sh", "/setup/entrypoint.sh"]
+    ports:
+      # Plaintext stays loopback-only. TLS is published on a routable
+      # interface so cross-host clients can connect encrypted; this mirrors the
+      # intended production shape rather than exposing plaintext on the LAN.
+      - "127.0.0.1:6667:6667"
+      - "0.0.0.0:6697:6697"
+    volumes:
+      - ./entrypoint.sh:/setup/entrypoint.sh:ro
+      - ergo-data:/ircd
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6667 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  ergo-data:
