@@ -21,6 +21,7 @@ import (
 	"github.com/joey/jkp/internal/ergoacct"
 	"github.com/joey/jkp/internal/invite"
 	"github.com/joey/jkp/internal/irc"
+	"github.com/joey/jkp/internal/lan"
 	"github.com/joey/jkp/internal/room"
 )
 
@@ -289,33 +290,9 @@ func RealDeps(roomDir, lanIPOverride, ocSessionOverride string) (Deps, error) {
 	}, nil
 }
 
-// detectLANIP shells out to find the routable address.
+// detectLANIP finds a routable LAN IPv4 on macOS and Linux.
 func detectLANIP() (string, error) {
-	out, err := exec.Command("route", "-n", "get", "default").Output()
-	if err != nil {
-		return "", fmt.Errorf("detect LAN IP: %w", err)
-	}
-	var iface string
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "interface:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				iface = fields[len(fields)-1]
-			}
-		}
-	}
-	if iface == "" {
-		return "", fmt.Errorf("cannot determine default interface")
-	}
-	ipOut, err := exec.Command("ipconfig", "getifaddr", iface).Output()
-	if err != nil {
-		return "", fmt.Errorf("getifaddr %s: %w", iface, err)
-	}
-	ip := strings.TrimSpace(string(ipOut))
-	if ip == "" {
-		return "", fmt.Errorf("interface %s has no IPv4", iface)
-	}
-	return ip, nil
+	return lan.Detect()
 }
 
 //go:embed entrypoint.sh

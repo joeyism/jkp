@@ -7,7 +7,6 @@ package lan
 import (
 	"fmt"
 	"net"
-	"os/exec"
 	"strings"
 )
 
@@ -19,7 +18,8 @@ type Input struct {
 
 // Choose returns the best routable IPv4 address. The order is:
 //  1. First non-loopback, non-link-local, non-docker IPv4 on DefaultIface.
-//  2. First such IPv4 on any other interface.
+//  2. A usable IPv4 on a physical-looking interface (en*/eth*/wl*).
+//  3. Any other usable IPv4, avoiding docker/bridge/vpn names.
 //
 // Loopback (127.0.0.0/8), link-local (169.254.0.0/16), and Docker bridge
 // (172.16.0.0/12) are always rejected. RFC 1918 is allowed.
@@ -31,94 +31,86 @@ func Choose(in Input) (string, error) {
 			}
 		}
 	}
-	for _, iface := range in.Addrs {
-		for _, cidr := range iface {
+	var best string
+	bestRank := 100
+	for name, cidrs := range in.Addrs {
+		rank := ifaceRank(name)
+		if rank >= bestRank {
+			continue
+		}
+		for _, cidr := range cidrs {
 			if ip := usableIPv4(cidr); ip != "" {
-				return ip, nil
+				best = ip
+				bestRank = rank
+				break
 			}
 		}
 	}
-	return "", fmt.Errorf("no routable LAN address found; pass --lan-ip")
+	if best == "" {
+		return "", fmt.Errorf("no routable LAN address found; pass --lan-ip")
+	}
+	return best, nil
 }
 
-// Detect shells out to find the default-route interface and its IPv4.
-// Returns ("", err) when it cannot determine one.
+func ifaceRank(name string) int {
+	n := strings.ToLower(name)
+	switch {
+	case n == "docker0" || strings.HasPrefix(n, "br-") || strings.HasPrefix(n, "veth") ||
+		strings.HasPrefix(n, "virbr") || strings.HasPrefix(n, "cni") || strings.HasPrefix(n, "flannel") ||
+		strings.HasPrefix(n, "tun") || strings.HasPrefix(n, "tap") || strings.HasPrefix(n, "utun") ||
+		strings.HasPrefix(n, "wg"):
+		return 50
+	case strings.HasPrefix(n, "en") || strings.HasPrefix(n, "eth") || strings.HasPrefix(n, "wl") ||
+		strings.HasPrefix(n, "em") || strings.HasPrefix(n, "re") || strings.HasPrefix(n, "bond"):
+		return 0
+	default:
+		return 10
+	}
+}
+
+// Detect finds a routable LAN IPv4 using the Go net package (macOS and Linux).
+// It prefers the source address the OS would use for a default-route packet,
+// then falls back to enumerating interfaces. Returns ("", err) when none is usable.
 func Detect() (string, error) {
-	iface := defaultInterface()
-	if iface == "" {
-		return "", fmt.Errorf("cannot determine default interface")
-	}
-	addrs := map[string][]string{
-		iface: {ipv4Of(iface)},
-	}
-	for _, name := range allInterfaces() {
-		if _, ok := addrs[name]; !ok {
-			addrs[name] = []string{ipv4Of(name)}
+	if ip, err := udpSourceIPv4(); err == nil {
+		if u := usableIPv4(ip); u != "" {
+			return u, nil
 		}
 	}
-	return Choose(Input{DefaultIface: iface, Addrs: addrs})
+	return Choose(Input{Addrs: interfaceCIDRs()})
 }
 
-// defaultInterface runs `route -n get default` (macOS) or `ip route` (Linux).
-func defaultInterface() string {
-	out, err := exec.Command("route", "-n", "get", "default").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "interface:") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					return fields[len(fields)-1]
-				}
-			}
-		}
+// udpSourceIPv4 asks the kernel which local IPv4 it would use to reach the
+// internet. UDP "connect" does not send packets; it only consults the routing table.
+func udpSourceIPv4() (string, error) {
+	conn, err := net.Dial("udp4", "1.1.1.1:53")
+	if err != nil {
+		return "", err
 	}
-	out, err = exec.Command("ip", "route", "show", "default").Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.Contains(line, "dev ") {
-				fields := strings.Fields(line)
-				for i, f := range fields {
-					if f == "dev" && i+1 < len(fields) {
-						return fields[i+1]
-					}
-				}
-			}
-		}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil {
+		return "", fmt.Errorf("no local IPv4")
 	}
-	return ""
+	return addr.IP.String(), nil
 }
 
-// ipv4Of returns the first IPv4 CIDR on iface.
-func ipv4Of(iface string) string {
-	out, err := exec.Command("ipconfig", "getifaddr", iface).Output()
-	if err == nil {
-		return strings.TrimSpace(string(out)) + "/24"
-	}
-	out, err = exec.Command("ip", "-4", "-o", "addr", "show", "dev", iface).Output()
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			fields := strings.Fields(line)
-			for i, f := range fields {
-				if f == "inet" && i+1 < len(fields) {
-					return fields[i+1]
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// allInterfaces lists interface names.
-func allInterfaces() []string {
+func interfaceCIDRs() map[string][]string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	var names []string
-	for _, ifc := range ifaces {
-		names = append(names, ifc.Name)
+	out := make(map[string][]string)
+	for _, ifi := range ifaces {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			out[ifi.Name] = append(out[ifi.Name], a.String())
+		}
 	}
-	return names
+	return out
 }
 
 // usableIPv4 parses a CIDR and returns the IP if it is acceptable.

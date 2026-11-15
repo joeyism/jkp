@@ -66,11 +66,31 @@ func TestFallsBackToOtherInterfaces(t *testing.T) {
 	got, err := lan.Choose(lan.Input{
 		DefaultIface: "en0",
 		Addrs: map[string][]string{
-			"en0":  {"172.20.0.1/16"},
-			"en1":  {"192.168.0.100/24"},
+			"en0": {"172.20.0.1/16"},
+			"en1": {"192.168.0.100/24"},
 		},
 	})
 	if err != nil || got != "192.168.0.100" {
 		t.Fatalf("got %q %v", got, err)
+	}
+}
+
+func TestFallbackPrefersPhysicalInterfaceOverNamedBridges(t *testing.T) {
+	in := lan.Input{
+		Addrs: map[string][]string{
+			"docker0": {"172.17.0.1/16"},
+			"br-abc":  {"192.168.64.1/20"},
+			"wlp1s0":  {"192.168.1.153/24"},
+			"en0":     {"10.0.0.5/24"},
+		},
+	}
+	for i := 0; i < 50; i++ {
+		got, err := lan.Choose(in)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if got == "192.168.64.1" || got == "172.17.0.1" {
+			t.Fatalf("iteration %d: picked bridge %q", i, got)
+		}
 	}
 }
