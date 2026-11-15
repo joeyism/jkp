@@ -314,6 +314,20 @@ func TestChooseSayAgentSelectsOneOfMultipleGuestSessions(t *testing.T) {
 	}
 }
 
+func TestChooseSayAgentSelectsByPaneOpenCodeURLBeforeTimestamps(t *testing.T) {
+	infos := []control.Info{
+		{Role: "host", Nick: "host", SessionID: "ses-host", OpenCodeURL: "http://127.0.0.1:4096"},
+		{Role: "guest", Nick: "g1", Peer: "host", SessionID: "ses-guest", OpenCodeURL: "http://127.0.0.1:4097"},
+	}
+	got, err := chooseSayAgentForPane(infos, "", "http://localhost:4097", func(control.Info) (int64, error) {
+		t.Fatal("timestamp lookup must not run when pane URL uniquely identifies the agent")
+		return 0, nil
+	})
+	if err != nil || got.Nick != "g1" {
+		t.Fatalf("got %#v, err=%v; want g1", got, err)
+	}
+}
+
 func TestSaySessionIDPrefersOpenCodePaneThenJKP(t *testing.T) {
 	env := func(key string) string {
 		switch key {

@@ -339,7 +339,8 @@ func (c *CLI) say(args []string) error {
 	if err != nil {
 		return err
 	}
-	info, err := chooseSayAgent(infos, resolvePaneSession(*sessionFlag, c.Env), func(info control.Info) (int64, error) {
+	session, paneURL := resolvePaneBinding(*sessionFlag, c.Env)
+	info, err := chooseSayAgentForPane(infos, session, paneURL, func(info control.Info) (int64, error) {
 		updated, ok := host.OpenCodeSessionUpdated(info.OpenCodeURL, c.Env("OPENCODE_SERVER_PASSWORD"), info.SessionID)
 		if !ok {
 			return 0, fmt.Errorf("cannot read OpenCode session %s from %s", info.SessionID, info.OpenCodeURL)
@@ -388,7 +389,17 @@ func resolvePaneSession(session string, getenv func(string) string) string {
 	if session != "" && !claudeadapter.IsUnexpandedPlaceholder(session) {
 		return strings.TrimSpace(session)
 	}
-	return saySessionID(getenv)
+	if paneSession := saySessionID(getenv); paneSession != "" {
+		return paneSession
+	}
+	_, paneSession := host.PaneOpenCodeBinding(getenv)
+	return paneSession
+}
+
+func resolvePaneBinding(session string, getenv func(string) string) (sessionID, serverURL string) {
+	serverURL, _ = host.PaneOpenCodeBinding(getenv)
+	sessionID = resolvePaneSession(session, getenv)
+	return sessionID, serverURL
 }
 
 func (c *CLI) logCmd(args []string) error {
@@ -410,7 +421,8 @@ func (c *CLI) logCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	info, err := chooseSayAgent(infos, resolvePaneSession(*sessionFlag, c.Env), func(info control.Info) (int64, error) {
+	session, paneURL := resolvePaneBinding(*sessionFlag, c.Env)
+	info, err := chooseSayAgentForPane(infos, session, paneURL, func(info control.Info) (int64, error) {
 		updated, ok := host.OpenCodeSessionUpdated(info.OpenCodeURL, c.Env("OPENCODE_SERVER_PASSWORD"), info.SessionID)
 		if !ok {
 			return 0, fmt.Errorf("cannot read OpenCode session %s from %s", info.SessionID, info.OpenCodeURL)
@@ -459,6 +471,10 @@ func saySessionID(getenv func(string) string) string {
 }
 
 func chooseSayAgent(infos []control.Info, sessionOverride string, updated func(control.Info) (int64, error)) (control.Info, error) {
+	return chooseSayAgentForPane(infos, sessionOverride, "", updated)
+}
+
+func chooseSayAgentForPane(infos []control.Info, sessionOverride, serverURLOverride string, updated func(control.Info) (int64, error)) (control.Info, error) {
 	if len(infos) == 0 {
 		return control.Info{}, fmt.Errorf("not in a room; run jkp host or jkp join first (jkp help)")
 	}
@@ -469,6 +485,22 @@ func chooseSayAgent(infos []control.Info, sessionOverride string, updated func(c
 			}
 		}
 		return control.Info{}, fmt.Errorf("no live jkp agent is bound to OpenCode session %s", sessionOverride)
+	}
+	if serverURLOverride != "" {
+		wantURL := host.NormalizeOpenCodeURL(serverURLOverride)
+		matched := make([]control.Info, 0, len(infos))
+		for _, info := range infos {
+			if host.NormalizeOpenCodeURL(info.OpenCodeURL) == wantURL {
+				matched = append(matched, info)
+			}
+		}
+		if len(matched) == 0 {
+			return control.Info{}, fmt.Errorf("no live jkp agent is bound to this OpenCode server %s", wantURL)
+		}
+		if len(matched) == 1 {
+			return matched[0], nil
+		}
+		infos = matched
 	}
 	if len(infos) == 1 {
 		return infos[0], nil

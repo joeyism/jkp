@@ -246,10 +246,14 @@ func RealDeps(roomDir, lanIPOverride, ocSessionOverride string) (Deps, error) {
 			return os.Getenv(key)
 		}
 	}
+	paneURL, paneSession, unservedTUI := PaneOpenCodeBindingWith(getenv, processCommandByPID)
+	if unservedTUI {
+		return Deps{}, fmt.Errorf("this OpenCode window has no server for jkp to refresh; restart it with 'opencode --port 4096' (or another free port), 'opencode attach <url>', or ocmux")
+	}
 	ocURL, ocSession, reusable := reusableHostBinding(roomDir)
 	if reusable {
 		cwd, _ := os.Getwd()
-		if err := validateReusableHostBinding(control.Info{OpenCodeURL: ocURL, SessionID: ocSession}, requestedOpenCodeSession(getenv), cwd, getenv("OPENCODE_SERVER_PASSWORD")); err != nil {
+		if err := validateReusableHostBindingForPane(control.Info{OpenCodeURL: ocURL, SessionID: ocSession}, paneURL, paneSession, cwd, getenv("OPENCODE_SERVER_PASSWORD")); err != nil {
 			return Deps{}, err
 		}
 	}

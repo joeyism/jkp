@@ -15,9 +15,56 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok: $*"; }
 
+# Every non-binary asset fetched by install.sh must be staged by the release workflow.
+for asset in install.sh opencode-jkp.md opencode-jkp-skill.md claude-jkp.md pi-jkp.ts SHA256SUMS; do
+  if ! grep -Fq "$asset" "$ROOT/.github/workflows/release.yml"; then
+    fail "release workflow does not stage installer asset: $asset"
+  fi
+done
+pass "release workflow stages all installer assets"
+
+# A project-local OpenCode command shadows ~/.config/opencode/command/jkp.md.
+# Keep this repository from shipping the old host-only prototype, which would
+# ignore an invite argument and tell guests to run `jkp host`.
+if [ -f "$ROOT/.opencode/command/jkp.md" ]; then
+  fail "stale project-local .opencode/command/jkp.md shadows the invite-aware installed command"
+fi
+if ! grep -Fq 'If `$ARGUMENTS` starts with `jkp1.`' "$ROOT/integrations/opencode/jkp.md"; then
+  fail "canonical OpenCode command does not route jkp1 invites to join"
+fi
+pass "OpenCode invite command is not shadowed by project-local prototype"
+
 SANDBOX="$(mktemp -d)"
 RELEASE="$(mktemp -d)"
-trap 'rm -rf "$SANDBOX" "$RELEASE"' EXIT
+TOOLS="$(mktemp -d)"
+trap 'rm -rf "$SANDBOX" "$RELEASE" "$TOOLS"' EXIT
+
+# Keep the installer PATH independent of runner-provided tools (including Go).
+for tool in sh uname mktemp rm curl awk mkdir cp chmod dirname; do
+  tool_path="$(PATH="/usr/bin:/bin:$PATH" command -v "$tool" 2>/dev/null)" \
+    || fail "required host tool not found: $tool"
+  ln -s "$tool_path" "$TOOLS/$tool"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  ln -s "$(PATH="/usr/bin:/bin:$PATH" command -v sha256sum)" "$TOOLS/sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  ln -s "$(PATH="/usr/bin:/bin:$PATH" command -v shasum)" "$TOOLS/shasum"
+else
+  fail "neither sha256sum nor shasum found"
+fi
+
+if _sys_go="$(PATH="/usr/bin:/bin" command -v go 2>/dev/null)"; then
+  echo "diag: host /usr/bin:/bin has go at $_sys_go ($(/bin/ls -ld "$_sys_go" 2>/dev/null || true))"
+else
+  echo "diag: host /usr/bin:/bin has no go"
+fi
+
+assert_no_go_in_path() {
+  _check_path="$1"
+  if _found_go="$(HOME="$SANDBOX" PATH="$_check_path" command -v go 2>/dev/null)"; then
+    fail "go is present in sandbox PATH ($_check_path): $_found_go ($(/bin/ls -ld "$_found_go" 2>/dev/null || true))"
+  fi
+}
 
 # --- fixture binary ---
 if [ -n "${JKP_FIXTURE_BIN:-}" ] && [ -x "$JKP_FIXTURE_BIN" ]; then
@@ -86,7 +133,7 @@ with socketserver.TCPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandl
     httpd.serve_forever()
 " "$RELEASE" > "$SRV_LOG" 2>&1 &
 SRV_PID=$!
-trap 'kill $SRV_PID 2>/dev/null; rm -rf "$SANDBOX" "$RELEASE" "$SRV_LOG"' EXIT
+trap 'kill $SRV_PID 2>/dev/null; rm -rf "$SANDBOX" "$RELEASE" "$TOOLS" "$SRV_LOG"' EXIT
 
 # wait for port
 PORT=""
@@ -110,11 +157,12 @@ fi
 # CASE 1: happy path (binary + hooks installed, exit 0)
 # ============================================================
 echo "--- case 1: happy path ---"
+assert_no_go_in_path "$TOOLS:$SANDBOX/.local/bin"
 if HOME="$SANDBOX" \
    JKP_PREFIX="$SANDBOX/.local" \
    JKP_RELEASE_BASE="$BASE" \
    JKP_TARGET="linux-amd64" \
-   PATH="/usr/bin:/bin:$SANDBOX/.local/bin" \
+   PATH="$TOOLS:$SANDBOX/.local/bin" \
    sh "$ROOT/scripts/install.sh"
 then
   pass "install.sh exited 0"
@@ -123,13 +171,11 @@ else
 fi
 
 # go must not be on the sandbox PATH
-if HOME="$SANDBOX" PATH="/usr/bin:/bin:$SANDBOX/.local/bin" command -v go >/dev/null 2>&1; then
-  fail "go is present in sandbox PATH"
-fi
+assert_no_go_in_path "$TOOLS:$SANDBOX/.local/bin"
 pass "go absent from sandbox PATH"
 
 # binary runs
-GOT="$(HOME="$SANDBOX" PATH="/usr/bin:/bin:$SANDBOX/.local/bin" "$SANDBOX/.local/bin/jkp" version 2>&1 || true)"
+GOT="$(HOME="$SANDBOX" PATH="$TOOLS:$SANDBOX/.local/bin" "$SANDBOX/.local/bin/jkp" version 2>&1 || true)"
 if [ "$GOT" != "ci-test" ]; then
   fail "jkp version: got '$GOT', want 'ci-test'"
 fi
@@ -170,7 +216,7 @@ HOME="$SANDBOX" \
   JKP_PREFIX="$SANDBOX/.local2" \
   JKP_RELEASE_BASE="$BASE" \
   JKP_TARGET="linux-amd64" \
-  PATH="/usr/bin:/bin" \
+  PATH="$TOOLS" \
   sh "$ROOT/scripts/install.sh" > "$SANDBOX/case2.out" 2>&1
 RC2=$?
 set -e
@@ -189,7 +235,7 @@ HOME="$SANDBOX" \
   JKP_PREFIX="$SANDBOX/.local3" \
   JKP_RELEASE_BASE="$BASE" \
   JKP_TARGET="linux-amd64" \
-  PATH="/usr/bin:/bin" \
+  PATH="$TOOLS" \
   sh "$ROOT/scripts/install.sh" > "$SANDBOX/case3.out" 2>&1
 RC3=$?
 set -e
@@ -227,15 +273,14 @@ if [ "${JKP_SKIP_REAL_BINARY:-}" != "1" ] && command -v go >/dev/null 2>&1; then
     if HOME="$SANDBOX" \
        JKP_PREFIX="$SANDBOX/.local4" \
        JKP_RELEASE_BASE="$BASE" \
-       JKP_TARGET="$_REAL_TARGET" \
-       PATH="/usr/bin:/bin:$SANDBOX/.local4/bin" \
+       PATH="$TOOLS:$SANDBOX/.local4/bin" \
        sh "$ROOT/scripts/install.sh"
     then
       pass "real binary install exited 0"
     else
       fail "real binary install exited $?"
     fi
-    GOT4="$(HOME="$SANDBOX" PATH="/usr/bin:/bin:$SANDBOX/.local4/bin" "$SANDBOX/.local4/bin/jkp" version 2>&1 || true)"
+    GOT4="$(HOME="$SANDBOX" PATH="$TOOLS:$SANDBOX/.local4/bin" "$SANDBOX/.local4/bin/jkp" version 2>&1 || true)"
     [ "$GOT4" = "ci-test" ] || fail "real binary: got '$GOT4', want 'ci-test'"
     pass "real Go binary prints ci-test"
   fi

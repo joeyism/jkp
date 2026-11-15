@@ -3,6 +3,7 @@ package host
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,15 +20,18 @@ import (
 // DiscoverOpenCodeIn binds this pane's OpenCode server and session.
 func DiscoverOpenCodeIn(getenv func(string) string, controlDir string) (string, string, error) {
 	cwd, _ := os.Getwd()
-	return discoverOpenCode(getenv, controlDir, cwd)
+	return discoverOpenCodeWithProcess(getenv, processCommandByPID, controlDir, cwd, defaultOpenCodeCandidates())
 }
 
 func discoverOpenCode(getenv func(string) string, controlDir, cwd string) (string, string, error) {
-	return discoverOpenCodeWithCandidates(getenv, controlDir, cwd, defaultOpenCodeCandidates())
+	return discoverOpenCodeWithProcess(getenv, processCommandByPID, controlDir, cwd, defaultOpenCodeCandidates())
 }
 
 func defaultOpenCodeCandidates() []string {
-	ports := []int{4096}
+	ports := make([]int, 0, 15+16)
+	for port := 4096; port <= 4110; port++ {
+		ports = append(ports, port)
+	}
 	for port := 4200; port <= 4215; port++ {
 		ports = append(ports, port)
 	}
@@ -39,16 +43,29 @@ func defaultOpenCodeCandidates() []string {
 }
 
 func discoverOpenCodeWithCandidates(getenv func(string) string, controlDir, cwd string, candidates []string) (string, string, error) {
+	return discoverOpenCodeWithProcess(getenv, processCommandByPID, controlDir, cwd, candidates)
+}
+
+func discoverOpenCodeWithProcess(getenv func(string) string, lookupCmd func(string) string, controlDir, cwd string, candidates []string) (string, string, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
+	if lookupCmd == nil {
+		lookupCmd = processCommandByPID
+	}
+	if len(candidates) == 0 {
+		candidates = defaultOpenCodeCandidates()
+	}
 	password := getenv("OPENCODE_SERVER_PASSWORD")
-	session := requestedOpenCodeSession(getenv)
+	paneURL, session, unservedTUI := PaneOpenCodeBindingWith(getenv, lookupCmd)
+	if unservedTUI {
+		return "", "", fmt.Errorf("this OpenCode window has no server for jkp to refresh; restart it with 'opencode --port 4096' (or another free port), 'opencode attach <url>', or ocmux")
+	}
 	bound, err := boundOpenCodeSessions(controlDir)
 	if err != nil {
 		return "", "", err
 	}
-	explicitURL := strings.TrimRight(strings.TrimSpace(getenv("JKP_OC_URL")), "/")
+	explicitURL := paneURL
 	urls := make([]string, 0, len(candidates)+1)
 	if explicitURL != "" {
 		urls = append(urls, explicitURL)
@@ -79,7 +96,7 @@ func discoverOpenCodeWithCandidates(getenv func(string) string, controlDir, cwd 
 			if !found || sess.ParentID != "" || (sess.Directory != "" && canonicalPath(sess.Directory) != cwdCanonical) {
 				return "", "", fmt.Errorf("OpenCode session %s is not a top-level session for %s", session, cwdCanonical)
 			}
-			if bound[sessionKey(candidate, session)] {
+			if bound[session] {
 				return "", "", fmt.Errorf("OpenCode session %s is already bound to another jkp agent", session)
 			}
 			return candidate, session, nil
@@ -91,7 +108,7 @@ func discoverOpenCodeWithCandidates(getenv func(string) string, controlDir, cwd 
 			}
 			continue
 		}
-		if id := pickUnboundSession(sessions, candidate, bound, cwdCanonical); id != "" {
+		if id := pickUnboundSession(sessions, bound, cwdCanonical); id != "" {
 			return candidate, id, nil
 		}
 	}
@@ -102,6 +119,189 @@ func discoverOpenCodeWithCandidates(getenv func(string) string, controlDir, cwd 
 		return "", "", fmt.Errorf("no unbound top-level OpenCode session found for %s; open a session or pass --oc-session", cwdCanonical)
 	}
 	return "", "", noServerForDirectory(cwd, "")
+}
+
+type paneProcessInfo struct {
+	SessionID   string
+	ServerURL   string
+	UnservedTUI bool
+}
+
+// processCommandByPID returns the process command line for the OpenCode pane
+// identified by OPENCODE_PID. It is injectable so discovery tests never depend
+// on the test runner's own process tree.
+func processCommandByPID(pid string) string {
+	pid = strings.TrimSpace(pid)
+	if pid == "" {
+		return ""
+	}
+	output, err := exec.Command("ps", "-p", pid, "-o", "command=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func parseOpenCodeCommandLine(command string) paneProcessInfo {
+	fields := strings.Fields(command)
+	if len(fields) == 0 || !strings.HasPrefix(strings.ToLower(filepath.Base(fields[0])), "opencode") {
+		return paneProcessInfo{}
+	}
+
+	info := paneProcessInfo{}
+	hostname := "127.0.0.1"
+	port := 0
+	commandName := ""
+	attach := false
+	serverOnly := map[string]bool{
+		"serve": true, "web": true, "run": true, "acp": true, "mcp": true,
+		"completion": true, "debug": true, "providers": true, "auth": true,
+		"agent": true, "upgrade": true, "uninstall": true, "models": true,
+		"stats": true, "export": true, "import": true, "github": true,
+		"pr": true, "session": true, "plugin": true, "plug": true, "db": true,
+	}
+	valueFlags := map[string]bool{
+		"-s": true, "--session": true, "--port": true, "--hostname": true,
+		"-p": true, "--password": true, "-u": true, "--username": true,
+		"--log-level": true, "--replay-limit": true, "--dir": true,
+	}
+	for i := 1; i < len(fields); i++ {
+		field := fields[i]
+		if field == "attach" {
+			commandName, attach = "attach", true
+			continue
+		}
+		if field == "-s" || field == "--session" {
+			if i+1 < len(fields) {
+				i++
+				info.SessionID = fields[i]
+			}
+			continue
+		}
+		if value, ok := strings.CutPrefix(field, "-s="); ok {
+			info.SessionID = value
+			continue
+		}
+		if value, ok := strings.CutPrefix(field, "--session="); ok {
+			info.SessionID = value
+			continue
+		}
+		if field == "--port" {
+			if i+1 < len(fields) {
+				i++
+				port, _ = strconv.Atoi(fields[i])
+			}
+			continue
+		}
+		if value, ok := strings.CutPrefix(field, "--port="); ok {
+			port, _ = strconv.Atoi(value)
+			continue
+		}
+		if field == "--hostname" {
+			if i+1 < len(fields) {
+				i++
+				hostname = fields[i]
+			}
+			continue
+		}
+		if value, ok := strings.CutPrefix(field, "--hostname="); ok {
+			hostname = value
+			continue
+		}
+		if valueFlags[field] {
+			if i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			continue
+		}
+		if attach && info.ServerURL == "" {
+			info.ServerURL = NormalizeOpenCodeURL(field)
+			if info.ServerURL != "" {
+				continue
+			}
+		}
+		if commandName == "" && serverOnly[field] {
+			commandName = field
+		}
+	}
+
+	if info.ServerURL == "" && port > 0 {
+		hostname = normalizeOpenCodeHostname(hostname)
+		info.ServerURL = NormalizeOpenCodeURL("http://" + net.JoinHostPort(hostname, strconv.Itoa(port)))
+	}
+	info.UnservedTUI = info.ServerURL == "" && (commandName == "" || commandName == "attach")
+	return info
+}
+
+// NormalizeOpenCodeURL normalizes local wildcard/localhost URLs to the loopback
+// URL form used by the local server registry and agent bindings.
+func NormalizeOpenCodeURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" {
+		return strings.TrimRight(raw, "/")
+	}
+	host := normalizeOpenCodeHostname(u.Hostname())
+	if port := u.Port(); port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		u.Host = "[" + host + "]"
+	} else {
+		u.Host = host
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return strings.TrimRight(u.String(), "/")
+}
+
+func normalizeOpenCodeHostname(host string) string {
+	switch strings.ToLower(strings.Trim(host, "[]")) {
+	case "localhost", "0.0.0.0", "::", "[::]":
+		return "127.0.0.1"
+	default:
+		return strings.Trim(host, "[]")
+	}
+}
+
+// PaneOpenCodeBindingWith returns the pane's server URL, session ID, and
+// whether it is an unserved TUI. Explicit environment overrides take precedence
+// over process-derived values.
+func PaneOpenCodeBindingWith(getenv func(string) string, lookupCmd func(string) string) (serverURL, sessionID string, unservedTUI bool) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if lookupCmd == nil {
+		lookupCmd = processCommandByPID
+	}
+	info := paneProcessInfo{}
+	if pid := strings.TrimSpace(getenv("OPENCODE_PID")); pid != "" {
+		info = parseOpenCodeCommandLine(lookupCmd(pid))
+	}
+	serverURL = NormalizeOpenCodeURL(getenv("JKP_OC_URL"))
+	if serverURL == "" {
+		serverURL = info.ServerURL
+	}
+	for _, key := range []string{"JKP_OC_SESSION", "OPENCODE_SESSION_ID"} {
+		if value := strings.TrimSpace(getenv(key)); value != "" {
+			sessionID = value
+			break
+		}
+	}
+	if sessionID == "" {
+		sessionID = info.SessionID
+	}
+	unservedTUI = info.UnservedTUI && strings.TrimSpace(getenv("JKP_OC_URL")) == ""
+	return serverURL, sessionID, unservedTUI
+}
+
+// PaneOpenCodeBinding returns the current pane's explicitly known server URL
+// and session ID. It does not return an error for an unserved TUI; callers that
+// initiate discovery should use PaneOpenCodeBindingWith to detect that case.
+func PaneOpenCodeBinding(getenv func(string) string) (serverURL, sessionID string) {
+	serverURL, sessionID, _ = PaneOpenCodeBindingWith(getenv, processCommandByPID)
+	return serverURL, sessionID
 }
 
 func noServerForDirectory(cwd, other string) error {
@@ -125,35 +325,8 @@ func uniqueURLs(urls []string) []string {
 	return out
 }
 
-func requestedOpenCodeSession(getenv func(string) string) string {
-	for _, key := range []string{"JKP_OC_SESSION", "OPENCODE_SESSION_ID"} {
-		if value := strings.TrimSpace(getenv(key)); value != "" {
-			return value
-		}
-	}
-	if pid := strings.TrimSpace(getenv("OPENCODE_PID")); pid != "" {
-		if out, err := exec.Command("ps", "-p", pid, "-o", "command=").Output(); err == nil {
-			return sessionIDFromCommandLine(string(out))
-		}
-	}
-	return ""
-}
-
 func sessionIDFromCommandLine(command string) string {
-	fields := strings.Fields(command)
-	for i, field := range fields {
-		if field == "-s" || field == "--session" {
-			if i+1 < len(fields) {
-				return fields[i+1]
-			}
-		}
-		for _, prefix := range []string{"--session=", "-s="} {
-			if value, ok := strings.CutPrefix(field, prefix); ok {
-				return value
-			}
-		}
-	}
-	return ""
+	return parseOpenCodeCommandLine(command).SessionID
 }
 
 type ocmuxServe struct {
@@ -314,7 +487,7 @@ func fetchSessions(baseURL, password string, directory ...string) ([]ocSession, 
 	return sessions, true
 }
 
-func pickUnboundSession(sessions []ocSession, baseURL string, bound map[string]bool, cwd string) string {
+func pickUnboundSession(sessions []ocSession, bound map[string]bool, cwd string) string {
 	var bestDir, bestUnknownDir, bestAny *ocSession
 	cwdAbs := ""
 	if cwd != "" {
@@ -325,7 +498,7 @@ func pickUnboundSession(sessions []ocSession, baseURL string, bound map[string]b
 		if session.ParentID != "" {
 			continue
 		}
-		if bound[sessionKey(baseURL, session.ID)] {
+		if bound[session.ID] {
 			continue
 		}
 		if bestAny == nil || session.Time.Updated > bestAny.Time.Updated {
@@ -387,7 +560,7 @@ func boundOpenCodeSessions(controlDir string) (map[string]bool, error) {
 	}
 	for _, info := range infos {
 		if info.OpenCodeURL != "" && info.SessionID != "" {
-			bound[sessionKey(info.OpenCodeURL, info.SessionID)] = true
+			bound[info.SessionID] = true
 		}
 	}
 	return bound, nil
@@ -410,6 +583,13 @@ func reusableHostBinding(roomDir string) (string, string, bool) {
 }
 
 func validateReusableHostBinding(info control.Info, requestedSession, cwd, password string) error {
+	return validateReusableHostBindingForPane(info, "", requestedSession, cwd, password)
+}
+
+func validateReusableHostBindingForPane(info control.Info, requestedURL, requestedSession, cwd, password string) error {
+	if requestedURL != "" && NormalizeOpenCodeURL(requestedURL) != NormalizeOpenCodeURL(info.OpenCodeURL) {
+		return fmt.Errorf("a jkp host room is already bound to OpenCode session %s at %s; run jkp reset first to host from %s", info.SessionID, info.OpenCodeURL, requestedURL)
+	}
 	if requestedSession != "" && requestedSession != info.SessionID {
 		return fmt.Errorf("a jkp host room is already bound to OpenCode session %s; run jkp reset first to host from session %s", info.SessionID, requestedSession)
 	}
@@ -429,10 +609,6 @@ func validateReusableHostBinding(info control.Info, requestedSession, cwd, passw
 		return fmt.Errorf("a jkp host room is already bound to OpenCode session %s in %s; run jkp reset first to host from %s", info.SessionID, session.Directory, canonicalPath(cwd))
 	}
 	return nil
-}
-
-func sessionKey(baseURL, sessionID string) string {
-	return strings.TrimRight(baseURL, "/") + "/" + sessionID
 }
 
 // OpenCodeSessionUpdated returns the server's update timestamp for sessionID.

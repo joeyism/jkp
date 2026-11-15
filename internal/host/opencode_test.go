@@ -3,6 +3,7 @@ package host
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -40,9 +41,7 @@ func TestPickNewestUnboundOpenCodeSession(t *testing.T) {
 			Updated int64 `json:"updated"`
 		}{Updated: 30}},
 	}
-	got := pickUnboundSession(sessions, "http://127.0.0.1:4200", map[string]bool{
-		"http://127.0.0.1:4200/host-session": true,
-	}, "")
+	got := pickUnboundSession(sessions, map[string]bool{"host-session": true}, "")
 	if got != "guest-session" {
 		t.Fatalf("selected session %q, want guest-session", got)
 	}
@@ -50,11 +49,38 @@ func TestPickNewestUnboundOpenCodeSession(t *testing.T) {
 
 func TestPickUnboundOpenCodeSessionReturnsEmptyWhenAllTaken(t *testing.T) {
 	sessions := []ocSession{{ID: "only-session"}}
-	got := pickUnboundSession(sessions, "http://127.0.0.1:4200", map[string]bool{
-		"http://127.0.0.1:4200/only-session": true,
-	}, "")
+	got := pickUnboundSession(sessions, map[string]bool{"only-session": true}, "")
 	if got != "" {
 		t.Fatalf("selected session %q, want none", got)
+	}
+}
+
+func TestPickUnboundOpenCodeSessionHonorsBindingFromSiblingPort(t *testing.T) {
+	sessions := []ocSession{
+		{ID: "ses_host", Time: struct {
+			Updated int64 `json:"updated"`
+		}{Updated: 500}},
+		{ID: "ses_guest", Time: struct {
+			Updated int64 `json:"updated"`
+		}{Updated: 100}},
+	}
+	got := pickUnboundSession(sessions, map[string]bool{"ses_host": true}, "")
+	if got != "ses_guest" {
+		t.Fatalf("selected %q, want ses_guest; ses_host is bound on another local port", got)
+	}
+}
+
+func TestReusableHostBindingRejectsDifferentServerPortOnSameMachine(t *testing.T) {
+	cwd := t.TempDir()
+	server := newOpenCodeTestServer(t, "/path",
+		fmt.Sprintf(`{"directory":%q,"worktree":%q}`, cwd, cwd),
+		fmt.Sprintf(`[{"id":"ses-host","directory":%q}]`, cwd))
+	err := validateReusableHostBindingForPane(
+		control.Info{OpenCodeURL: server.URL, SessionID: "ses-host"},
+		"http://127.0.0.1:4097", "", cwd, "",
+	)
+	if err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("expected port mismatch conflict, got %v", err)
 	}
 }
 
@@ -82,6 +108,34 @@ func TestDiscoverOpenCodeSkipsSessionBoundByLiveLocalAgent(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, control.HostFileName)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBoundOpenCodeSessionsTracksSessionAcrossServerPorts(t *testing.T) {
+	dir := t.TempDir()
+	path, err := control.Path(dir, "host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Save(path, control.Info{
+		Addr: "http://127.0.0.1:1", Token: "secret", Role: "host", Nick: "host",
+		PID: os.Getpid(), SessionID: "ses_host", OpenCodeURL: "http://127.0.0.1:4096",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := boundOpenCodeSessions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bound["ses_host"] {
+		t.Fatalf("session bound on :4096 not recorded globally: %#v", bound)
+	}
+	if got := pickUnboundSession([]ocSession{{ID: "ses_host", Time: struct {
+		Updated int64 `json:"updated"`
+	}{Updated: 500}}, {ID: "ses_guest", Time: struct {
+		Updated int64 `json:"updated"`
+	}{Updated: 100}}}, bound, ""); got != "ses_guest" {
+		t.Fatalf("selected %q, want ses_guest when host session is bound on another port", got)
 	}
 }
 
@@ -133,7 +187,7 @@ func TestPickUnboundSessionPrefersExactWorkingDirectory(t *testing.T) {
 			Updated int64 `json:"updated"`
 		}{Updated: 10}},
 	}
-	got := pickUnboundSession(sessions, "http://127.0.0.1:4200", map[string]bool{}, dir)
+	got := pickUnboundSession(sessions, map[string]bool{}, dir)
 	if got != "cwd-older" {
 		t.Fatalf("selected %q, want the session in cwd even if older", got)
 	}
@@ -148,7 +202,7 @@ func TestPickUnboundSessionNeverFallsBackToAnotherDirectory(t *testing.T) {
 			Updated int64 `json:"updated"`
 		}{Updated: 100},
 	}}
-	got := pickUnboundSession(sessions, "http://127.0.0.1:4200", map[string]bool{}, cwd)
+	got := pickUnboundSession(sessions, map[string]bool{}, cwd)
 	if got != "" {
 		t.Fatalf("selected cross-directory session %q; want no session", got)
 	}
@@ -164,7 +218,7 @@ func TestPickUnboundSessionSkipsSubagentSessions(t *testing.T) {
 			Updated int64 `json:"updated"`
 		}{Updated: 100}},
 	}
-	if got := pickUnboundSession(sessions, "http://127.0.0.1:4200", map[string]bool{}, cwd); got != "top-level" {
+	if got := pickUnboundSession(sessions, map[string]bool{}, cwd); got != "top-level" {
 		t.Fatalf("selected %q, want top-level session", got)
 	}
 }
@@ -275,6 +329,150 @@ func TestExplicitSessionIDComesFromOpenCodeProcessCommand(t *testing.T) {
 	}
 }
 
+func TestParseOpenCodeCommandLineExtractsPaneBinding(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		command     string
+		sessionID   string
+		serverURL   string
+		unservedTUI bool
+	}{
+		{
+			name:      "tui with session and port",
+			command:   "opencode -s ses_guest --port 4097",
+			sessionID: "ses_guest",
+			serverURL: "http://127.0.0.1:4097",
+		},
+		{
+			name:      "equals flags and wildcard hostname",
+			command:   "/opt/homebrew/bin/opencode --session=ses_a --hostname=0.0.0.0 --port=4102 /repo",
+			sessionID: "ses_a",
+			serverURL: "http://127.0.0.1:4102",
+		},
+		{
+			name:      "attach command",
+			command:   "opencode attach http://localhost:4200 --session ses_attached",
+			sessionID: "ses_attached",
+			serverURL: "http://127.0.0.1:4200",
+		},
+		{
+			name:      "serve subcommand",
+			command:   "opencode serve --port 4203",
+			serverURL: "http://127.0.0.1:4203",
+		},
+		{
+			name:        "plain unserved tui with session",
+			command:     "opencode -s ses_plain",
+			sessionID:   "ses_plain",
+			unservedTUI: true,
+		},
+		{
+			name:        "bare unserved tui",
+			command:     "opencode",
+			unservedTUI: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseOpenCodeCommandLine(tc.command)
+			if got.SessionID != tc.sessionID || got.ServerURL != tc.serverURL || got.UnservedTUI != tc.unservedTUI {
+				t.Fatalf("parseOpenCodeCommandLine(%q) = %+v; want session=%q URL=%q unserved=%t",
+					tc.command, got, tc.sessionID, tc.serverURL, tc.unservedTUI)
+			}
+		})
+	}
+}
+
+func TestPaneOpenCodeBindingHonorsExplicitOverridesAndProcessCommand(t *testing.T) {
+	values := map[string]string{"OPENCODE_PID": "123", "OPENCODE_SESSION_ID": "ses_env"}
+	lookup := func(pid string) string {
+		if pid == "123" {
+			return "opencode -s ses_process --port 4097"
+		}
+		return ""
+	}
+	getenv := func(key string) string { return values[key] }
+	serverURL, sessionID, unserved := PaneOpenCodeBindingWith(getenv, lookup)
+	if serverURL != "http://127.0.0.1:4097" || sessionID != "ses_env" || unserved {
+		t.Fatalf("pane binding = (%q, %q, %t), want process URL and environment session", serverURL, sessionID, unserved)
+	}
+	values["JKP_OC_URL"] = "http://localhost:4200/"
+	values["JKP_OC_SESSION"] = "ses_override"
+	serverURL, sessionID, unserved = PaneOpenCodeBindingWith(getenv, lookup)
+	if serverURL != "http://127.0.0.1:4200" || sessionID != "ses_override" || unserved {
+		t.Fatalf("explicit pane binding = (%q, %q, %t)", serverURL, sessionID, unserved)
+	}
+}
+
+func TestDefaultOpenCodeCandidatesIncludeSecondPanePorts(t *testing.T) {
+	want := map[string]bool{
+		"http://127.0.0.1:4096": false,
+		"http://127.0.0.1:4097": false,
+		"http://127.0.0.1:4110": false,
+		"http://127.0.0.1:4200": false,
+	}
+	for _, candidate := range defaultOpenCodeCandidates() {
+		if _, ok := want[candidate]; ok {
+			want[candidate] = true
+		}
+	}
+	for candidate, found := range want {
+		if !found {
+			t.Errorf("fallback candidates missing %s", candidate)
+		}
+	}
+}
+
+func TestDiscoverOpenCodeUsesPanePortBeforeSiblingCandidate(t *testing.T) {
+	cwd := t.TempDir()
+	sessions := fmt.Sprintf(`[{"id":"ses_host","directory":%q,"time":{"updated":500}},{"id":"ses_guest","directory":%q,"time":{"updated":100}}]`, cwd, cwd)
+	pathJSON := fmt.Sprintf(`{"directory":%q,"worktree":%q}`, cwd, cwd)
+	hostServer := newOpenCodeTestServer(t, "/path", pathJSON, sessions)
+	guestServer := newOpenCodeTestServer(t, "/path", pathJSON, sessions)
+	guestPort := guestServer.Listener.Addr().(*net.TCPAddr).Port
+	getenv := func(key string) string {
+		if key == "OPENCODE_PID" {
+			return "6112"
+		}
+		return ""
+	}
+	lookup := func(pid string) string {
+		if pid == "6112" {
+			return fmt.Sprintf("opencode -s ses_guest --port %d", guestPort)
+		}
+		return ""
+	}
+	gotURL, gotSession, err := discoverOpenCodeWithProcess(getenv, lookup, t.TempDir(), cwd, []string{hostServer.URL})
+	if err != nil {
+		t.Fatalf("discoverOpenCodeWithProcess: %v", err)
+	}
+	if gotURL != guestServer.URL || gotSession != "ses_guest" {
+		t.Fatalf("binding = (%q, %q), want (%q, ses_guest); sibling was %q", gotURL, gotSession, guestServer.URL, hostServer.URL)
+	}
+}
+
+func TestDiscoverOpenCodeRejectsUnservedTUIInsteadOfUsingSibling(t *testing.T) {
+	cwd := t.TempDir()
+	sibling := newOpenCodeTestServer(t, "/path",
+		fmt.Sprintf(`{"directory":%q,"worktree":%q}`, cwd, cwd),
+		fmt.Sprintf(`[{"id":"ses_plain","directory":%q,"time":{"updated":100}}]`, cwd))
+	getenv := func(key string) string {
+		if key == "OPENCODE_PID" {
+			return "33369"
+		}
+		return ""
+	}
+	lookup := func(pid string) string {
+		if pid == "33369" {
+			return "opencode -s ses_plain"
+		}
+		return ""
+	}
+	_, _, err := discoverOpenCodeWithProcess(getenv, lookup, t.TempDir(), cwd, []string{sibling.URL})
+	if err == nil || !strings.Contains(err.Error(), "--port") {
+		t.Fatalf("expected unserved-TUI guidance, got %v", err)
+	}
+}
+
 func TestReusableHostBindingRejectsDifferentDirectory(t *testing.T) {
 	other := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -379,6 +577,32 @@ func TestRealDepsReusesHostBindingInCurrentDirectory(t *testing.T) {
 	deps, err := RealDeps(cwd, "", "")
 	if err != nil || deps.OpenCodeURL != server.URL || deps.OpenCodeSession != "ses-current" {
 		t.Fatalf("RealDeps binding=(%q,%q), err=%v", deps.OpenCodeURL, deps.OpenCodeSession, err)
+	}
+}
+
+func TestRealDepsRejectsReusableHostBindingFromAnotherOpenCodePort(t *testing.T) {
+	cwd := t.TempDir()
+	restore := chdirForTest(t, cwd)
+	defer restore()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/path":
+			_, _ = fmt.Fprintf(w, `{"directory":%q,"worktree":%q}`, cwd, cwd)
+		case "/session/ses-current":
+			_, _ = fmt.Fprintf(w, `{"id":"ses-current","directory":%q}`, cwd)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	writeLiveHostRoom(t, cwd, server.URL, "ses-current")
+	t.Setenv("OPENCODE_PID", "")
+	t.Setenv("OPENCODE_SESSION_ID", "")
+	t.Setenv("JKP_OC_SESSION", "")
+	t.Setenv("JKP_OC_URL", "http://127.0.0.1:4097")
+	_, err := RealDeps(cwd, "", "")
+	if err == nil || !strings.Contains(err.Error(), "already bound") || !strings.Contains(err.Error(), "4097") {
+		t.Fatalf("RealDeps error = %v, want different-pane server conflict", err)
 	}
 }
 
