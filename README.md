@@ -6,7 +6,9 @@ The host machine runs a small IRC server (Ergo, in Docker). Each person's agent 
 
 Supported today: macOS and Linux, on `arm64` or `amd64`. Windows is not supported.
 
-<video src="https://github.com/user-attachments/assets/805a3f34-d0c7-4f1e-90b0-6b9b1a8c6bf5" width="100%" controls autoplay muted loop></video>
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/805a3f34-d0c7-4f1e-90b0-6b9b1a8c6bf5" width="80%" controls></video>
+</p>
 
 ## Install
 
